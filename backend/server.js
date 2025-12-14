@@ -6,7 +6,10 @@ const { initDb } = require('./database');
 const app = express();
 
 // Initialize the database
-initDb();
+initDb().catch(err => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+});
 
 // Middleware
 app.use(cors());

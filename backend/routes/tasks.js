@@ -1,20 +1,22 @@
 const express = require('express');
-const db = require('../db');
+const { Task, User, TaskApplication, Rating, TaskComment } = require('../db');
 const { authenticateToken } = require('../middleware');
 const router = express.Router();
 
 // Get user's own tasks (given by them) - MUST BE BEFORE /:id
 router.get('/my/given', authenticateToken, async (req, res) => {
     try {
-        const tasks = await db.query(
-            `SELECT t.*, u.username as acceptor_username
-             FROM tasks t
-             LEFT JOIN users u ON t.acceptor_id = u.user_id
-             WHERE t.giver_id = ?
-             ORDER BY t.created_at DESC`,
-            [req.user.id]
-        );
-        res.json(tasks.rows);
+        const tasks = await Task.find({ giver_id: req.user.id })
+            .populate('acceptor_id', 'username')
+            .sort({ created_at: -1 });
+        
+        const formattedTasks = tasks.map(task => ({
+            ...task.toObject(),
+            task_id: task._id,
+            acceptor_username: task.acceptor_id ? task.acceptor_id.username : null
+        }));
+        
+        res.json(formattedTasks);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -24,15 +26,18 @@ router.get('/my/given', authenticateToken, async (req, res) => {
 // Get user's accepted tasks - MUST BE BEFORE /:id
 router.get('/my/accepted', authenticateToken, async (req, res) => {
     try {
-        const tasks = await db.query(
-            `SELECT t.*, u.username as giver_username, u.phone_number as giver_phone
-             FROM tasks t
-             JOIN users u ON t.giver_id = u.user_id
-             WHERE t.acceptor_id = ?
-             ORDER BY t.created_at DESC`,
-            [req.user.id]
-        );
-        res.json(tasks.rows);
+        const tasks = await Task.find({ acceptor_id: req.user.id })
+            .populate('giver_id', 'username phone_number')
+            .sort({ created_at: -1 });
+        
+        const formattedTasks = tasks.map(task => ({
+            ...task.toObject(),
+            task_id: task._id,
+            giver_username: task.giver_id.username,
+            giver_phone: task.giver_id.phone_number
+        }));
+        
+        res.json(formattedTasks);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -42,16 +47,25 @@ router.get('/my/accepted', authenticateToken, async (req, res) => {
 // Get user's withdrawn/removed tasks (for rating purposes) - MUST BE BEFORE /:id
 router.get('/my/withdrawn-removed', authenticateToken, async (req, res) => {
     try {
-        const tasks = await db.query(
-            `SELECT t.*, u.username as giver_username, u.phone_number as giver_phone, ta.status as application_status
-             FROM task_applications ta
-             JOIN tasks t ON ta.task_id = t.task_id
-             JOIN users u ON t.giver_id = u.user_id
-             WHERE ta.applicant_id = ? AND ta.status IN ('WITHDRAWN', 'REMOVED')
-             ORDER BY ta.applied_at DESC`,
-            [req.user.id]
-        );
-        res.json(tasks.rows);
+        const applications = await TaskApplication.find({
+            applicant_id: req.user.id,
+            status: { $in: ['WITHDRAWN', 'REMOVED'] }
+        })
+            .populate({
+                path: 'task_id',
+                populate: { path: 'giver_id', select: 'username phone_number' }
+            })
+            .sort({ applied_at: -1 });
+        
+        const formattedTasks = applications.map(app => ({
+            ...app.task_id.toObject(),
+            task_id: app.task_id._id,
+            application_status: app.status,
+            giver_username: app.task_id.giver_id.username,
+            giver_phone: app.task_id.giver_id.phone_number
+        }));
+        
+        res.json(formattedTasks);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -61,17 +75,28 @@ router.get('/my/withdrawn-removed', authenticateToken, async (req, res) => {
 // Get user's applications - MUST BE BEFORE /:id
 router.get('/my/applications', authenticateToken, async (req, res) => {
     try {
-        const applications = await db.query(
-            `SELECT a.*, t.title, t.description, t.reward, t.deadline, t.status as task_status,
-                    u.username as giver_username
-             FROM task_applications a
-             JOIN tasks t ON a.task_id = t.task_id
-             JOIN users u ON t.giver_id = u.user_id
-             WHERE a.applicant_id = ?
-             ORDER BY a.applied_at DESC`,
-            [req.user.id]
-        );
-        res.json(applications.rows);
+        const applications = await TaskApplication.find({ applicant_id: req.user.id })
+            .populate({
+                path: 'task_id',
+                populate: { path: 'giver_id', select: 'username' }
+            })
+            .sort({ applied_at: -1 });
+        
+        const formattedApplications = applications.map(app => ({
+            application_id: app._id,
+            task_id: app.task_id._id,
+            applicant_id: app.applicant_id,
+            status: app.status,
+            applied_at: app.applied_at,
+            title: app.task_id.title,
+            description: app.task_id.description,
+            reward: app.task_id.reward,
+            deadline: app.task_id.deadline,
+            task_status: app.task_id.status,
+            giver_username: app.task_id.giver_id.username
+        }));
+        
+        res.json(formattedApplications);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -82,25 +107,25 @@ router.get('/my/applications', authenticateToken, async (req, res) => {
 router.get('/', authenticateToken, async (req, res) => {
     try {
         const { status } = req.query;
-        let query = `SELECT t.*, u.username as giver_username, u.giving_rating,
-                     COALESCE(u.trophies, 0) as giver_trophies
-                     FROM tasks t
-                     JOIN users u ON t.giver_id = u.user_id`;
-        let params = [];
+        let query = {};
         
         if (status) {
-            query += ` WHERE t.status = ?`;
-            params.push(status);
+            query.status = status;
         }
         
-        query += ` ORDER BY t.created_at DESC`;
+        const tasks = await Task.find(query)
+            .populate('giver_id', 'username giving_rating trophies')
+            .sort({ created_at: -1 });
         
-        const tasks = await db.query(query, params);
+        const formattedTasks = tasks.map(task => ({
+            ...task.toObject(),
+            task_id: task._id,
+            giver_username: task.giver_id.username,
+            giving_rating: task.giver_id.giving_rating,
+            giver_trophies: task.giver_id.trophies || 0
+        }));
         
-        // Return tasks with trophies
-        const tasksWithTrophies = tasks.rows;
-        
-        res.json(tasksWithTrophies);
+        res.json(formattedTasks);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -110,38 +135,38 @@ router.get('/', authenticateToken, async (req, res) => {
 // Get a single task by ID with applications
 router.get('/:id', authenticateToken, async (req, res) => {
     try {
-        const task = await db.query(
-            `SELECT t.*, u.username as giver_username, u.giving_rating, u.phone_number as giver_phone,
-                    COALESCE(u.trophies, 0) as giver_trophies
-             FROM tasks t
-             JOIN users u ON t.giver_id = u.user_id
-             WHERE t.task_id = ?`,
-            [req.params.id]
-        );
+        const task = await Task.findById(req.params.id)
+            .populate('giver_id', 'username giving_rating phone_number trophies');
         
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(404).json({ msg: 'Task not found' });
         }
 
-        const taskData = task.rows[0];
+        const taskData = task.toObject();
 
         // Get applications for this task
-        const applications = await db.query(
-            `SELECT a.*, u.username, u.accepting_rating, u.phone_number,
-                    COALESCE(u.trophies, 0) as trophies
-             FROM task_applications a
-             JOIN users u ON a.applicant_id = u.user_id
-             WHERE a.task_id = ?
-             ORDER BY a.applied_at DESC`,
-            [req.params.id]
-        );
+        const applications = await TaskApplication.find({ task_id: req.params.id })
+            .populate('applicant_id', 'username accepting_rating phone_number trophies')
+            .sort({ applied_at: -1 });
 
-        // Return applications with trophies
-        const applicationsWithTrophies = applications.rows;
+        const formattedApplications = applications.map(app => ({
+            application_id: app._id,
+            task_id: app.task_id,
+            applicant_id: app.applicant_id._id,
+            status: app.status,
+            applied_at: app.applied_at,
+            username: app.applicant_id.username,
+            accepting_rating: app.applicant_id.accepting_rating,
+            phone_number: app.applicant_id.phone_number,
+            trophies: app.applicant_id.trophies || 0
+        }));
 
         res.json({
-            task: taskData,
-            applications: applicationsWithTrophies
+            task: {
+                ...taskData,
+                task_id: taskData._id
+            },
+            applications: formattedApplications
         });
     } catch (err) {
         console.error(err.message);
@@ -155,12 +180,19 @@ router.post('/', authenticateToken, async (req, res) => {
     const giver_id = req.user.id;
 
     try {
-        const result = await db.run(
-            "INSERT INTO tasks (giver_id, title, description, reward, deadline) VALUES (?, ?, ?, ?, ?)",
-            [giver_id, title, description, reward, deadline]
-        );
-        const newTask = await db.query("SELECT * FROM tasks WHERE task_id = ?", [result.lastID]);
-        res.status(201).json(newTask.rows[0]);
+        const newTask = new Task({
+            giver_id,
+            title,
+            description,
+            reward,
+            deadline
+        });
+        const savedTask = await newTask.save();
+        const taskObj = savedTask.toObject();
+        res.status(201).json({
+            ...taskObj,
+            task_id: taskObj._id
+        });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -174,35 +206,33 @@ router.post('/:id/apply', authenticateToken, async (req, res) => {
         const applicantId = req.user.id;
 
         // Check if task exists and is open
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND status = 'OPEN'",
-            [taskId]
-        );
+        const task = await Task.findOne({ _id: taskId, status: 'OPEN' });
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(404).json({ msg: 'Task not found or not open' });
         }
 
         // Check if user is the task giver
-        if (task.rows[0].giver_id === applicantId) {
+        if (task.giver_id.toString() === applicantId) {
             return res.status(400).json({ msg: 'Cannot apply to your own task' });
         }
 
         // Check if already applied
-        const existingApp = await db.query(
-            "SELECT * FROM task_applications WHERE task_id = ? AND applicant_id = ?",
-            [taskId, applicantId]
-        );
+        const existingApp = await TaskApplication.findOne({
+            task_id: taskId,
+            applicant_id: applicantId
+        });
 
-        if (existingApp.rows.length > 0) {
+        if (existingApp) {
             return res.status(400).json({ msg: 'Already applied to this task' });
         }
 
         // Create application
-        await db.run(
-            "INSERT INTO task_applications (task_id, applicant_id) VALUES (?, ?)",
-            [taskId, applicantId]
-        );
+        const newApplication = new TaskApplication({
+            task_id: taskId,
+            applicant_id: applicantId
+        });
+        await newApplication.save();
 
         res.status(201).json({ msg: 'Application submitted successfully' });
     } catch (err) {
@@ -219,35 +249,32 @@ router.post('/:id/accept/:applicantId', authenticateToken, async (req, res) => {
         const giverId = req.user.id;
 
         // Verify the user is the task giver
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND giver_id = ?",
-            [taskId, giverId]
-        );
+        const task = await Task.findOne({ _id: taskId, giver_id: giverId });
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(403).json({ msg: 'Not authorized' });
         }
 
-        if (task.rows[0].status !== 'OPEN') {
+        if (task.status !== 'OPEN') {
             return res.status(400).json({ msg: 'Task is not open' });
         }
 
         // Update task status and set acceptor
-        await db.run(
-            "UPDATE tasks SET status = 'IN_PROGRESS', acceptor_id = ? WHERE task_id = ?",
-            [applicantId, taskId]
-        );
+        await Task.findByIdAndUpdate(taskId, {
+            status: 'IN_PROGRESS',
+            acceptor_id: applicantId
+        });
 
         // Update application status
-        await db.run(
-            "UPDATE task_applications SET status = 'ACCEPTED' WHERE task_id = ? AND applicant_id = ?",
-            [taskId, applicantId]
+        await TaskApplication.findOneAndUpdate(
+            { task_id: taskId, applicant_id: applicantId },
+            { status: 'ACCEPTED' }
         );
 
         // Reject all other applications
-        await db.run(
-            "UPDATE task_applications SET status = 'REJECTED' WHERE task_id = ? AND applicant_id != ?",
-            [taskId, applicantId]
+        await TaskApplication.updateMany(
+            { task_id: taskId, applicant_id: { $ne: applicantId } },
+            { status: 'REJECTED' }
         );
 
         res.json({ msg: 'Application accepted successfully' });
@@ -265,19 +292,16 @@ router.post('/:id/reject/:applicantId', authenticateToken, async (req, res) => {
         const giverId = req.user.id;
 
         // Verify the user is the task giver
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND giver_id = ?",
-            [taskId, giverId]
-        );
+        const task = await Task.findOne({ _id: taskId, giver_id: giverId });
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(403).json({ msg: 'Not authorized' });
         }
 
         // Update application status
-        await db.run(
-            "UPDATE task_applications SET status = 'REJECTED' WHERE task_id = ? AND applicant_id = ?",
-            [taskId, applicantId]
+        await TaskApplication.findOneAndUpdate(
+            { task_id: taskId, applicant_id: applicantId },
+            { status: 'REJECTED' }
         );
 
         res.json({ msg: 'Application rejected' });
@@ -294,37 +318,28 @@ router.post('/:id/complete', authenticateToken, async (req, res) => {
         const giverId = req.user.id;
 
         // Verify the user is the task giver
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND giver_id = ?",
-            [taskId, giverId]
-        );
+        const task = await Task.findOne({ _id: taskId, giver_id: giverId });
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(403).json({ msg: 'Not authorized' });
         }
 
-        if (task.rows[0].status !== 'IN_PROGRESS') {
+        if (task.status !== 'IN_PROGRESS') {
             return res.status(400).json({ msg: 'Task must be in progress to complete' });
         }
 
-        const acceptorId = task.rows[0].acceptor_id;
+        const acceptorId = task.acceptor_id;
 
         // Update task status
-        await db.run(
-            "UPDATE tasks SET status = 'COMPLETED' WHERE task_id = ?",
-            [taskId]
-        );
+        await Task.findByIdAndUpdate(taskId, { status: 'COMPLETED' });
 
         // Award trophy (tasks completed successfully)
         if (acceptorId) {
             console.log(`Awarding trophy: acceptor ${acceptorId}`);
-            
-            // Give trophy to acceptor for completing the task
-            const acceptorResult = await db.run(
-                "UPDATE users SET trophies = COALESCE(trophies, 0) + 1 WHERE user_id = ?",
-                [acceptorId]
-            );
-            console.log('Trophy update result:', acceptorResult);
+            await User.findByIdAndUpdate(acceptorId, {
+                $inc: { trophies: 1 }
+            });
+            console.log('Trophy awarded successfully');
         } else {
             console.log('No acceptor found, skipping trophy award');
         }
@@ -343,20 +358,14 @@ router.delete('/:id', authenticateToken, async (req, res) => {
         const giverId = req.user.id;
 
         // Verify the user is the task giver
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND giver_id = ?",
-            [taskId, giverId]
-        );
+        const task = await Task.findOne({ _id: taskId, giver_id: giverId });
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(403).json({ msg: 'Not authorized' });
         }
 
         // Update task status to CANCELLED
-        await db.run(
-            "UPDATE tasks SET status = 'CANCELLED' WHERE task_id = ?",
-            [taskId]
-        );
+        await Task.findByIdAndUpdate(taskId, { status: 'CANCELLED' });
 
         res.json({ msg: 'Task cancelled successfully' });
     } catch (err) {
@@ -377,28 +386,24 @@ router.post('/:id/rate', authenticateToken, async (req, res) => {
         }
 
         // Get task details
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ?",
-            [taskId]
-        );
+        const task = await Task.findById(taskId);
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(404).json({ msg: 'Task not found' });
         }
 
-        const taskData = task.rows[0];
-
         // Check if user was involved in this task through applications (for WITHDRAWN/REMOVED cases)
-        const application = await db.query(
-            "SELECT * FROM task_applications WHERE task_id = ? AND applicant_id = ? AND status IN ('WITHDRAWN', 'REMOVED')",
-            [taskId, raterId]
-        );
+        const application = await TaskApplication.findOne({
+            task_id: taskId,
+            applicant_id: raterId,
+            status: { $in: ['WITHDRAWN', 'REMOVED'] }
+        });
 
         // Verify the user is involved in the task
-        const isGiver = taskData.giver_id === raterId;
-        const isAcceptor = taskData.acceptor_id === raterId;
-        const wasWithdrawn = application.rows.length > 0 && application.rows[0].applicant_id === raterId && application.rows[0].status === 'WITHDRAWN';
-        const wasRemoved = application.rows.length > 0 && application.rows[0].applicant_id === raterId && application.rows[0].status === 'REMOVED';
+        const isGiver = task.giver_id.toString() === raterId;
+        const isAcceptor = task.acceptor_id && task.acceptor_id.toString() === raterId;
+        const wasWithdrawn = application && application.status === 'WITHDRAWN';
+        const wasRemoved = application && application.status === 'REMOVED';
 
         if (!isGiver && !isAcceptor && !wasWithdrawn && !wasRemoved) {
             return res.status(403).json({ msg: 'Not authorized to rate this task' });
@@ -409,9 +414,9 @@ router.post('/:id/rate', authenticateToken, async (req, res) => {
         // 2. CANCELLED tasks: acceptor can rate giver
         // 3. WITHDRAWN: giver can rate the acceptor who withdrew
         // 4. REMOVED: removed acceptor can rate the giver
-        if (taskData.status === 'COMPLETED') {
+        if (task.status === 'COMPLETED') {
             // Both parties can rate
-        } else if (taskData.status === 'CANCELLED') {
+        } else if (task.status === 'CANCELLED') {
             // Only acceptor can rate giver
             if (!isAcceptor) {
                 return res.status(403).json({ msg: 'Only acceptor can rate on cancelled tasks' });
@@ -423,7 +428,7 @@ router.post('/:id/rate', authenticateToken, async (req, res) => {
             }
         } else if (wasRemoved) {
             // Only removed acceptor can rate the giver
-            if (!wasRemoved || rated_user_id !== taskData.giver_id) {
+            if (!wasRemoved || rated_user_id !== task.giver_id.toString()) {
                 return res.status(403).json({ msg: 'Only removed acceptor can rate the giver' });
             }
         } else {
@@ -435,18 +440,18 @@ router.post('/:id/rate', authenticateToken, async (req, res) => {
         
         // For withdrawn/removed cases, check the application
         if (wasWithdrawn || wasRemoved) {
-            const withdrawnUser = application.rows[0].applicant_id;
+            const withdrawnUser = application.applicant_id.toString();
             
             if (wasWithdrawn) {
                 // Giver rating the withdrawn acceptor
-                if (raterId === taskData.giver_id && rated_user_id === withdrawnUser) {
+                if (raterId === task.giver_id.toString() && rated_user_id === withdrawnUser) {
                     rating_type = 'ACCEPTING';
                 } else {
                     return res.status(403).json({ msg: 'Only giver can rate withdrawn acceptor' });
                 }
             } else if (wasRemoved) {
                 // Removed acceptor rating the giver
-                if (raterId === withdrawnUser && rated_user_id === taskData.giver_id) {
+                if (raterId === withdrawnUser && rated_user_id === task.giver_id.toString()) {
                     rating_type = 'GIVING';
                 } else {
                     return res.status(403).json({ msg: 'Only removed acceptor can rate the giver' });
@@ -454,14 +459,14 @@ router.post('/:id/rate', authenticateToken, async (req, res) => {
             }
         } else {
             // Normal cases: completed or cancelled
-            if (raterId === taskData.giver_id && rated_user_id === taskData.acceptor_id) {
+            if (raterId === task.giver_id.toString() && rated_user_id === task.acceptor_id.toString()) {
                 rating_type = 'ACCEPTING';
                 
                 // If task is cancelled, giver cannot rate acceptor
-                if (taskData.status === 'CANCELLED') {
+                if (task.status === 'CANCELLED') {
                     return res.status(403).json({ msg: 'Cannot rate acceptor for a cancelled task' });
                 }
-            } else if (raterId === taskData.acceptor_id && rated_user_id === taskData.giver_id) {
+            } else if (raterId === task.acceptor_id.toString() && rated_user_id === task.giver_id.toString()) {
                 rating_type = 'GIVING';
             } else {
                 return res.status(400).json({ msg: 'Invalid rating configuration' });
@@ -469,38 +474,43 @@ router.post('/:id/rate', authenticateToken, async (req, res) => {
         }
 
         // Check if already rated
-        const existingRating = await db.query(
-            "SELECT * FROM ratings WHERE task_id = ? AND rater_id = ?",
-            [taskId, raterId]
-        );
+        const existingRating = await Rating.findOne({
+            task_id: taskId,
+            rater_id: raterId
+        });
 
-        if (existingRating.rows.length > 0) {
+        if (existingRating) {
             return res.status(400).json({ msg: 'You have already rated this task' });
         }
 
         // Insert rating
-        await db.run(
-            "INSERT INTO ratings (task_id, rater_id, rated_id, rating_value, rating_type, comment) VALUES (?, ?, ?, ?, ?, ?)",
-            [taskId, raterId, rated_user_id, rating_value, rating_type, comment]
-        );
+        const newRating = new Rating({
+            task_id: taskId,
+            rater_id: raterId,
+            rated_id: rated_user_id,
+            rating_value,
+            rating_type,
+            comment: comment || null
+        });
+        await newRating.save();
 
         // Update user's average rating (including initial 5.0)
-        const sumRating = await db.query(
-            `SELECT SUM(rating_value) as sum_rating, COUNT(*) as count FROM ratings WHERE rated_id = ? AND rating_type = ?`,
-            [rated_user_id, rating_type]
-        );
+        const ratings = await Rating.find({
+            rated_id: rated_user_id,
+            rating_type
+        });
 
-        const sum = sumRating.rows[0].sum_rating || 0;
-        const count = sumRating.rows[0].count || 0;
+        const sum = ratings.reduce((acc, r) => acc + r.rating_value, 0);
+        const count = ratings.length;
         const newAvg = (5.0 + sum) / (count + 1);
         
-        const ratingColumn = rating_type === 'GIVING' ? 'giving_rating' : 'accepting_rating';
-        const countColumn = rating_type === 'GIVING' ? 'giving_rating_count' : 'accepting_rating_count';
+        const updateField = rating_type === 'GIVING' ? 'giving_rating' : 'accepting_rating';
+        const countField = rating_type === 'GIVING' ? 'giving_rating_count' : 'accepting_rating_count';
         
-        await db.run(
-            `UPDATE users SET ${ratingColumn} = ?, ${countColumn} = ? WHERE user_id = ?`,
-            [newAvg, count, rated_user_id]
-        );
+        await User.findByIdAndUpdate(rated_user_id, {
+            [updateField]: newAvg,
+            [countField]: count
+        });
 
         res.json({ msg: 'Rating submitted successfully' });
     } catch (err) {
@@ -515,12 +525,12 @@ router.get('/:id/has-rated', authenticateToken, async (req, res) => {
         const taskId = req.params.id;
         const userId = req.user.id;
 
-        const rating = await db.query(
-            "SELECT * FROM ratings WHERE task_id = ? AND rater_id = ?",
-            [taskId, userId]
-        );
+        const rating = await Rating.findOne({
+            task_id: taskId,
+            rater_id: userId
+        });
 
-        res.json({ has_rated: rating.rows.length > 0 });
+        res.json({ has_rated: !!rating });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -535,23 +545,26 @@ router.post('/:id/duplicate', authenticateToken, async (req, res) => {
         const { title, description, reward, deadline } = req.body;
 
         // Verify the user owns the original task
-        const originalTask = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND giver_id = ?",
-            [taskId, giverId]
-        );
+        const originalTask = await Task.findOne({ _id: taskId, giver_id: giverId });
 
-        if (originalTask.rows.length === 0) {
+        if (!originalTask) {
             return res.status(403).json({ msg: 'Not authorized or task not found' });
         }
 
         // Create new task with provided modifications
-        const result = await db.run(
-            "INSERT INTO tasks (giver_id, title, description, reward, deadline) VALUES (?, ?, ?, ?, ?)",
-            [giverId, title, description, reward, deadline]
-        );
-        
-        const newTask = await db.query("SELECT * FROM tasks WHERE task_id = ?", [result.lastID]);
-        res.status(201).json(newTask.rows[0]);
+        const newTask = new Task({
+            giver_id: giverId,
+            title,
+            description,
+            reward,
+            deadline
+        });
+        const savedTask = await newTask.save();
+        const taskObj = savedTask.toObject();
+        res.status(201).json({
+            ...taskObj,
+            task_id: taskObj._id
+        });
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -566,29 +579,25 @@ router.put('/:id', authenticateToken, async (req, res) => {
         const { deadline, comment } = req.body;
 
         // Verify the user owns the task
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND giver_id = ?",
-            [taskId, giverId]
-        );
+        const task = await Task.findOne({ _id: taskId, giver_id: giverId });
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(403).json({ msg: 'Not authorized or task not found' });
         }
 
         // Update deadline
         if (deadline) {
-            await db.run(
-                "UPDATE tasks SET deadline = ? WHERE task_id = ?",
-                [deadline, taskId]
-            );
+            await Task.findByIdAndUpdate(taskId, { deadline });
         }
 
         // Add comment about changes
         if (comment) {
-            await db.run(
-                "INSERT INTO task_comments (task_id, user_id, comment_text) VALUES (?, ?, ?)",
-                [taskId, giverId, comment]
-            );
+            const newComment = new TaskComment({
+                task_id: taskId,
+                user_id: giverId,
+                comment_text: comment
+            });
+            await newComment.save();
         }
 
         res.json({ msg: 'Task updated successfully' });
@@ -601,33 +610,34 @@ router.put('/:id', authenticateToken, async (req, res) => {
 // Get comments for a task (with nested structure)
 router.get('/:id/comments', authenticateToken, async (req, res) => {
     try {
-        const comments = await db.query(
-            `SELECT c.*, u.username, COALESCE(u.trophies, 0) as trophies, t.giver_id
-             FROM task_comments c
-             JOIN users u ON c.user_id = u.user_id
-             JOIN tasks t ON c.task_id = t.task_id
-             WHERE c.task_id = ?
-             ORDER BY c.created_at ASC`,
-            [req.params.id]
-        );
+        const comments = await TaskComment.find({ task_id: req.params.id })
+            .populate('user_id', 'username trophies')
+            .populate({
+                path: 'task_id',
+                select: 'giver_id'
+            })
+            .sort({ created_at: 1 });
         
         // Build nested structure
         const commentMap = {};
         const rootComments = [];
         
-        comments.rows.forEach(comment => {
-            comment.replies = [];
-            comment.total_trophies = (comment.trophies_given || 0) + (comment.trophies_accepted || 0);
-            commentMap[comment.comment_id] = comment;
+        comments.forEach(comment => {
+            const commentObj = comment.toObject();
+            commentObj.comment_id = commentObj._id;
+            commentObj.replies = [];
+            commentObj.total_trophies = commentObj.user_id.trophies || 0;
+            commentMap[commentObj.comment_id] = commentObj;
         });
         
-        comments.rows.forEach(comment => {
+        comments.forEach(comment => {
+            const commentObj = commentMap[comment._id];
             if (comment.parent_comment_id) {
-                if (commentMap[comment.parent_comment_id]) {
-                    commentMap[comment.parent_comment_id].replies.push(comment);
+                if (commentMap[comment.parent_comment_id.toString()]) {
+                    commentMap[comment.parent_comment_id.toString()].replies.push(commentObj);
                 }
             } else {
-                rootComments.push(comment);
+                rootComments.push(commentObj);
             }
         });
         
@@ -649,25 +659,27 @@ router.post('/:id/comments', authenticateToken, async (req, res) => {
             return res.status(400).json({ msg: 'Comment cannot be empty' });
         }
 
-        await db.run(
-            "INSERT INTO task_comments (task_id, user_id, comment_text, parent_comment_id) VALUES (?, ?, ?, ?)",
-            [taskId, userId, comment_text, parent_comment_id || null]
-        );
+        const newComment = new TaskComment({
+            task_id: taskId,
+            user_id: userId,
+            comment_text,
+            parent_comment_id: parent_comment_id || null
+        });
+        const savedComment = await newComment.save();
 
-        const newComment = await db.query(
-            `SELECT c.*, u.username, COALESCE(u.trophies, 0) as trophies, t.giver_id
-             FROM task_comments c
-             JOIN users u ON c.user_id = u.user_id
-             JOIN tasks t ON c.task_id = t.task_id
-             WHERE c.comment_id = last_insert_rowid()`,
-            []
-        );
+        const comment = await TaskComment.findById(savedComment._id)
+            .populate('user_id', 'username trophies')
+            .populate({
+                path: 'task_id',
+                select: 'giver_id'
+            });
 
-        const comment = newComment.rows[0];
-        comment.replies = [];
-        comment.total_trophies = (comment.trophies_given || 0) + (comment.trophies_accepted || 0);
+        const commentObj = comment.toObject();
+        commentObj.comment_id = commentObj._id;
+        commentObj.replies = [];
+        commentObj.total_trophies = commentObj.user_id.trophies || 0;
 
-        res.status(201).json(comment);
+        res.status(201).json(commentObj);
     } catch (err) {
         console.error(err.message);
         res.status(500).send('Server Error');
@@ -677,17 +689,19 @@ router.post('/:id/comments', authenticateToken, async (req, res) => {
 // Auto-cancel expired tasks (to be called periodically)
 router.post('/auto-cancel-expired', authenticateToken, async (req, res) => {
     try {
-        const result = await db.run(
-            `UPDATE tasks 
-             SET status = 'CANCELLED' 
-             WHERE status = 'OPEN' 
-             AND datetime(deadline) < datetime('now')`,
-            []
+        const result = await Task.updateMany(
+            {
+                status: 'OPEN',
+                deadline: { $lt: new Date() }
+            },
+            {
+                status: 'CANCELLED'
+            }
         );
 
         res.json({ 
             msg: 'Expired tasks cancelled', 
-            count: result.changes 
+            count: result.modifiedCount 
         });
     } catch (err) {
         console.error(err.message);
@@ -707,34 +721,37 @@ router.post('/:id/cant-do', authenticateToken, async (req, res) => {
         }
 
         // Verify the user is the acceptor
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND acceptor_id = ? AND status = 'IN_PROGRESS'",
-            [taskId, userId]
-        );
+        const task = await Task.findOne({
+            _id: taskId,
+            acceptor_id: userId,
+            status: 'IN_PROGRESS'
+        });
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(403).json({ msg: 'Not authorized or task is not in progress' });
         }
 
-        const taskData = task.rows[0];
-
         // Create a record of the withdrawal with reason
-        await db.run(
-            "INSERT INTO task_applications (task_id, applicant_id, status) VALUES (?, ?, ?)",
-            [taskId, userId, 'WITHDRAWN']
-        );
+        const newApplication = new TaskApplication({
+            task_id: taskId,
+            applicant_id: userId,
+            status: 'WITHDRAWN'
+        });
+        await newApplication.save();
 
         // Add reason as a comment
-        await db.run(
-            "INSERT INTO task_comments (task_id, user_id, comment_text) VALUES (?, ?, ?)",
-            [taskId, userId, `[WITHDRAWN] Reason: ${reason}`]
-        );
+        const newComment = new TaskComment({
+            task_id: taskId,
+            user_id: userId,
+            comment_text: `[WITHDRAWN] Reason: ${reason}`
+        });
+        await newComment.save();
 
         // Reset task to OPEN and remove acceptor
-        await db.run(
-            "UPDATE tasks SET status = 'OPEN', acceptor_id = NULL WHERE task_id = ?",
-            [taskId]
-        );
+        await Task.findByIdAndUpdate(taskId, {
+            status: 'OPEN',
+            acceptor_id: null
+        });
 
         res.json({ msg: 'Task released successfully. Giver can now rate you.' });
     } catch (err) {
@@ -755,39 +772,41 @@ router.post('/:id/remove-acceptor', authenticateToken, async (req, res) => {
         }
 
         // Verify the user is the task giver
-        const task = await db.query(
-            "SELECT * FROM tasks WHERE task_id = ? AND giver_id = ? AND status = 'IN_PROGRESS'",
-            [taskId, giverId]
-        );
+        const task = await Task.findOne({
+            _id: taskId,
+            giver_id: giverId,
+            status: 'IN_PROGRESS'
+        });
 
-        if (task.rows.length === 0) {
+        if (!task) {
             return res.status(403).json({ msg: 'Not authorized or task is not in progress' });
         }
 
-        const taskData = task.rows[0];
-        const acceptorId = taskData.acceptor_id;
+        const acceptorId = task.acceptor_id;
 
         if (!acceptorId) {
             return res.status(400).json({ msg: 'No acceptor assigned to this task' });
         }
 
         // Update application status to REMOVED
-        await db.run(
-            "UPDATE task_applications SET status = 'REMOVED' WHERE task_id = ? AND applicant_id = ?",
-            [taskId, acceptorId]
+        await TaskApplication.findOneAndUpdate(
+            { task_id: taskId, applicant_id: acceptorId },
+            { status: 'REMOVED' }
         );
 
         // Add reason as a comment
-        await db.run(
-            "INSERT INTO task_comments (task_id, user_id, comment_text) VALUES (?, ?, ?)",
-            [taskId, giverId, `[REMOVED ACCEPTOR] Reason: ${reason}`]
-        );
+        const newComment = new TaskComment({
+            task_id: taskId,
+            user_id: giverId,
+            comment_text: `[REMOVED ACCEPTOR] Reason: ${reason}`
+        });
+        await newComment.save();
 
         // Reset task to OPEN and remove acceptor
-        await db.run(
-            "UPDATE tasks SET status = 'OPEN', acceptor_id = NULL WHERE task_id = ?",
-            [taskId]
-        );
+        await Task.findByIdAndUpdate(taskId, {
+            status: 'OPEN',
+            acceptor_id: null
+        });
 
         res.json({ msg: 'Acceptor removed successfully. They can now rate you.' });
     } catch (err) {
